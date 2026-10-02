@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>AI Object Distance Meter</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#050a14;color:#fff;font-family:Arial,sans-serif}
+header{text-align:center;padding:15px 12px 8px}h1{margin:0;font-size:24px}header p{margin:6px 0;color:#9eacc4}
+.app{width:min(720px,94%);margin:auto}.card{background:#10192a;border:1px solid #263652;border-radius:18px;padding:13px;margin:11px 0}
+#view{position:relative;background:#000;border-radius:14px;overflow:hidden;aspect-ratio:4/3}
+video{width:100%;height:100%;object-fit:cover;display:block}
+canvas{position:absolute;inset:0;width:100%;height:100%}
+#status{position:absolute;left:8px;bottom:8px;background:#000b;padding:7px 9px;border-radius:8px;font-size:12px}
+#start{width:100%;padding:13px;border:0;border-radius:11px;background:#4278ff;color:white;font-size:16px;font-weight:bold;margin-top:10px}
+.result{text-align:center}.label{color:#9eacc4}.distance{font-size:55px;font-weight:800;margin:2px}.unit{color:#9eacc4}
+.units{display:flex;gap:7px;margin-top:10px}.units button{flex:1;padding:10px;border:0;border-radius:9px;background:#273650;color:white;font-weight:bold}.units .active{background:#4278ff}
+.info{color:#b6c2d7;line-height:1.5;font-size:14px}
+#loading{display:none;text-align:center;padding:8px;color:#9eacc4}
+</style>
+</head>
+<body>
+<header><h1>🤖 AI Object Distance Meter</h1><p>Automatic camera + object detection</p></header>
+<div class="app">
+<div class="card">
+<div id="view">
+<video id="video" autoplay muted playsinline></video>
+<canvas id="canvas"></canvas>
+<div id="status">Camera OFF</div>
+</div>
+<div id="loading">Loading AI model…</div>
+<button id="start">📷 Start AI Camera</button>
+</div>
+
+<div class="card result">
+<div class="label">Nearest detected object</div>
+<div id="object">--</div>
+<div class="distance" id="distance">--</div>
+<div class="unit" id="unit">meters</div>
+<div class="units">
+<button data-u="cm">CM</button><button data-u="m" class="active">METER</button><button data-u="km">KM</button>
+</div>
+</div>
+
+<div class="card info">
+<b>How it works</b><br>
+The AI detects common objects automatically. Distance is estimated from the object's bounding-box width and an approximate real-world object width. It does not require you to type the object size.
+<br><br><b>Accuracy:</b> approximate. Different object sizes, camera lenses and viewing angles affect the result. A phone with depth/AR hardware can provide better measurements.
+</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const video=document.getElementById('video'),canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d');
+const start=document.getElementById('start'),status=document.getElementById('status'),loading=document.getElementById('loading');
+const objectEl=document.getElementById('object'),distanceEl=document.getElementById('distance'),unitEl=document.getElementById('unit');
+let model=null,stream=null,unit='m',running=false,lastTime=0;
+
+const widths={
+ person:0.45, bicycle:0.60, car:1.80, motorcycle:0.80, bus:2.50, truck:2.40,
+ train:3.00, dog:0.35, cat:0.25, horse:0.70, sheep:0.60, cow:1.00,
+ chair:0.50, couch:1.80, bed:1.60, diningtable:1.20, laptop:0.35,
+ cell phone:0.075, tv:1.00, book:0.16, bottle:0.07, cup:0.08,
+ backpack:0.35, handbag:0.30, suitcase:0.55, umbrella:0.90,
+ skateboard:0.25, sports ball:0.23, frisbee:0.22, keyboard:0.45,
+ microwave:0.50, oven:0.65, refrigerator:0.75, bicycle:0.60
+};
+
+// Approximate horizontal field of view. Can be calibrated for a particular phone.
+const HFOV=65;
+
+function toSelected(m){
+  if(unit==='cm') return m*100;
+  if(unit==='km') return m/1000;
+  return m;
+}
+function decimals(){
+  return unit==='cm'?1:unit==='km'?4:2;
+}
+function distanceFromBox(label,pixelWidth){
+  const realWidth=widths[label];
+  if(!realWidth || pixelWidth<=0 || !video.videoWidth) return null;
+  // Pinhole-style estimate: angular width from the fraction of image width.
+  const frac=Math.min(pixelWidth/video.videoWidth,0.99);
+  const angle=2*Math.atan(Math.tan(HFOV*Math.PI/360)*frac);
+  return realWidth/(2*Math.tan(angle/2));
+}
+
+async function startCamera(){
+  try{
+    start.disabled=true;
+    status.textContent='Requesting camera…';
+    loading.style.display='block';
+    if(!model) model=await cocoSsd.load();
+    loading.textContent='AI model loaded. Starting camera…';
+    stream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},
+      audio:false
+    });
+    video.srcObject=stream;
+    await video.play();
+    running=true;
+    status.textContent='AI scanning…';
+    start.textContent='✅ AI Camera Running';
+    loading.style.display='none';
+    requestAnimationFrame(loop);
+  }catch(e){
+    loading.style.display='none';
+    start.disabled=false;
+    status.textContent='Camera/model error';
+    alert('Camera start nahi ho saka. Is page ko HTTPS website par open karo aur camera permission Allow karo.');
+    console.error(e);
+  }
+}
+
+async function loop(t){
+  if(!running)return;
+  if(video.readyState>=2 && t-lastTime>180){
+    lastTime=t;
+    const predictions=await model.detect(video);
+    draw(predictions);
+  }
+  requestAnimationFrame(loop);
+}
+
+function draw(predictions){
+  canvas.width=video.videoWidth||640; canvas.height=video.videoHeight||480;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  let best=null,bestD=Infinity;
+  for(const p of predictions){
+    if(p.score<0.55) continue;
+    const [x,y,w,h]=p.bbox;
+    const d=distanceFromBox(p.className,w);
+    ctx.strokeStyle='#31e981';ctx.lineWidth=3;ctx.strokeRect(x,y,w,h);
+    ctx.fillStyle='#31e981';ctx.font='bold 16px Arial';
+    const text=p.className+' '+Math.round(p.score*100)+'%'+(d?(' • '+toSelected(d).toFixed(decimals())+' '+unit):'');
+    const tw=ctx.measureText(text).width+10;
+    ctx.fillRect(x,Math.max(0,y-25),tw,25);
+    ctx.fillStyle='#06100a';ctx.fillText(text,x+5,Math.max(17,y-7));
+    if(d && d<bestD){bestD=d;best=p;}
+  }
+  if(best){
+    const d=distanceFromBox(best.className,best.bbox[2]);
+    objectEl.textContent=best.className;
+    distanceEl.textContent=toSelected(d).toFixed(decimals());
+    unitEl.textContent=unit==='cm'?'centimeters':unit==='km'?'kilometers':'meters';
+  }else{
+    objectEl.textContent='No supported object';
+    distanceEl.textContent='--';
+  }
+}
+
+document.querySelectorAll('.units button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.units button').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active'); unit=b.dataset.u;
+  unitEl.textContent=unit==='cm'?'centimeters':unit==='km'?'kilometers':'meters';
+});
+start.onclick=startCamera;
+</script>
+</body>
+</html>
